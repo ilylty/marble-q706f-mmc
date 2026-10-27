@@ -84,7 +84,42 @@ CI 里有硬断言（`if [ "$REL" != "$TARGET_TRIPLE" ]`），版本串不符直
 | `name` | 0x30 | 标记为 `q706f-mmc` |
 | 其余（`second_addr`, `id`, `os_version`, 各段地址） | — | **原样保留** |
 
-### 复现验证
+### ⚠️ 三个曾经踩过的坑（已修）
+
+### 坑 1：kernel 段必须用 `Image.gz`，不是裸 `Image`
+
+出厂 boot.img 的 kernel 段是 **gzip 流**（`1f 8b 08`，14,016,494 字节）。
+若误用裸 `Image`（`ARMd` magic，47,866,368 字节），打出来的 boot.img
+会变成 64MB（出厂是 30.4MB），bootloader 大概率拒收。
+
+现在 workflow 做三件事：
+- `make Image Image.gz dtbs`（同时出 `Image.gz`）
+- 校验 `Image.gz` 的 gzip magic 与体积区间（8–30MB）
+- 打包后校验 kernel 段 `< 20MB`、总长 `< 34.8MB`
+
+### 坑 2：`INSTALL_MOD_STRIP=1` 在 x86 runner 上会失败
+
+x86 runner 用宿主 `strip` 处理 arm64 `.ko`，报：
+
+```
+strip: Unable to recognise the format of the input file
+... aes-neon-blk.ko
+make[2]: *** [scripts/Makefile.modinst:124] Error 1
+```
+
+改用交叉工具链：`make modules_install STRIP=aarch64-linux-gnu-strip`
+
+### 坑 3：DTB 用出厂件，不重新生成
+
+出厂 DTB **本来就包含** `mmc@8804000` / `qcom,sdhci-msm-v5` /
+`sd-card-det-n-state` —— 硬件描述从未缺失，缺的只是内核驱动。
+
+重新编出的 DTB 与出厂件相比有 2998 行差异，但其中 566 处是
+`phandle` 重编号、148 处 `remote-endpoint`、102 处 `clocks` 等
+**引用重排**，语义等价。为避免引入无意义变量，CI 直接用
+`dtb-factory.bin`（出厂 142,268 字节）。
+
+## 复现验证
 
 用模板 + 出厂 kernel/ramdisk/dtb + 出厂 cmdline 重新打包，
 与出厂 `boot.img` 对比：

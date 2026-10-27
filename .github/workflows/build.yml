@@ -102,14 +102,15 @@ jobs:
           fi
           echo "VERIFIED_TRIPLE=$REL" >> "$GITHUB_ENV"
 
-      - name: Build Image + dtbs
+      - name: Build Image + Image.gz + dtbs
         run: |
           set -eux
           cd "$KDIR"
           export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
-          make -j"$(nproc)" Image dtbs
-          ls -lh arch/arm64/boot/Image
-          ls -lh arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dtb
+          # 关键：必须同时生成 Image.gz。出厂 boot.img 的 kernel 段是 gzip 流
+          # (前 3 字节 1f 8b 08，14,016,494 字节)，而非裸 Image (47MB+)。
+          make -j"$(nproc)" Image Image.gz dtbs
+          ls -lh arch/arm64/boot/Image arch/arm64/boot/Image.gz
 
       - name: Build modules (optional)
         if: ${{ inputs.build_modules }}
@@ -131,12 +132,24 @@ jobs:
           fi
           strings -a arch/arm64/boot/Image | grep -E '^mmcblk|sdhci' | head -10 || true
 
+          # Image.gz 必须存在且是 gzip、且尺寸接近出厂值
+          test -f arch/arm64/boot/Image.gz || { echo "::error::Image.gz 未生成"; exit 1; }
+          SZ=$(stat -c%s arch/arm64/boot/Image.gz)
+          MAGIC=$(head -c3 arch/arm64/boot/Image.gz | od -An -tx1 | tr -d ' \n')
+          echo "Image.gz: $SZ bytes, magic=$MAGIC"
+          [ "$MAGIC" = "1f8b08" ] || { echo "::error::Image.gz 不是 gzip"; exit 1; }
+          [ "$SZ" -gt 8000000 ]  || { echo "::error::Image.gz 过小，可疑"; exit 1; }
+          [ "$SZ" -lt 30000000 ] || { echo "::error::Image.gz 过大，可疑"; exit 1; }
+
       - name: Repack boot.img
         run: |
           set -eux
           mkdir -p out
-          cp "$KDIR/arch/arm64/boot/Image" out/kernel.img
-          cp "$KDIR/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dtb" out/dtb
+          # ★ 用 Image.gz，不是裸 Image（出厂 boot.img 的 kernel 段就是 gzip）
+          cp "$KDIR/arch/arm64/boot/Image.gz" out/kernel.img
+          # ★ 用出厂 DTB。DTB 本就包含 mmc@8804000 节点，无需重新生成；
+          #   重编会引入 phandle 重编号等无意义差异，反而增加风险。
+          cp dtb-factory.bin out/dtb
           cp ramdisk.img out/ramdisk
 
           python3 scripts/mkboot.py header-template.bin \
@@ -145,16 +158,29 @@ jobs:
 
           bash scripts/verify-bootimg.sh out/boot.img
 
+          # ★★ 最终尺寸护栏：出厂是 30,408,704 字节
+          TOTAL=$(stat -c%s out/boot.img)
+          KSZ=$(python3 -c "import struct;print(struct.unpack_from('<I',open('out/boot.img','rb').read(12),8)[0])")
+          echo "boot.img 总长 = $TOTAL   kernel 段 = $KSZ"
+          [ "$KSZ" -lt 20000000 ] || { echo "::error::kernel 段 >20MB，很可能又用了裸 Image"; exit 1; }
+          [ "$TOTAL" -lt 34800000 ] || { echo "::error::boot.img 总长偏离出厂值(30.4MB)太多"; exit 1; }
+
       - name: Stage modules tarball
         if: ${{ inputs.build_modules }}
         run: |
           set -eux
           mkdir -p out/mods
           cd "$KDIR"
-          export ARCH=arm64
-          make modules_install INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/mods" INSTALL_MOD_STRIP=1
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          # 不要用 INSTALL_MOD_STRIP=1：它在 x86 runner 下用宿主 strip 去处理
+          # arm64 .ko，会报 "Unable to recognise the format of the input file".
+          # 改用交叉 strip。
+          make modules_install \
+            INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/mods" \
+            STRIP=aarch64-linux-gnu-strip
           cd "$GITHUB_WORKSPACE"
           echo "安装模块数: $(find out/mods -name '*.ko' | wc -l)"
+          test -d "out/mods/lib/modules/$TARGET_TRIPLE" || { echo "::error::模块目录不在预期路径"; exit 1; }
           ( cd "out/mods/lib/modules/$TARGET_TRIPLE" && \
             tar czf "$GITHUB_WORKSPACE/out/modules-$TARGET_TRIPLE.tar.gz" . )
           ls -lh out/modules-*.tar.gz
