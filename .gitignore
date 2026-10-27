@@ -1,0 +1,5 @@
+work/
+out/
+linux-src.tar.gz
+*.o
+*.ko

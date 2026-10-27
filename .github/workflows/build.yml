@@ -1,0 +1,219 @@
+name: Build Q706F kernel (MMC enabled)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: "silime/linux commit / tag"
+        required: true
+        default: "d5f7815e9a86"
+      cmdline:
+        description: "boot.img cmdline"
+        required: true
+        default: "root=PARTLABEL=rootfs rw rootwait loglevel=8 ignore_loglevel console=tty0 fbcon=nodefer audit=0 slot_suffix=_a"
+      build_modules:
+        description: "同时编译模块（更慢，但可作备份/覆盖 rootfs 模块）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  TARGET_TRIPLE: "7.1.0-1-gd5f7815e9a86"
+  KREF: ${{ inputs.kernel_ref }}
+
+jobs:
+  build:
+    name: linux 7.1.0 + MMC
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Show runner
+        run: |
+          nproc; free -g | head -2; df -h /
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio kmod xz-utils zstd rsync device-tree-compiler gcc-aarch64-linux-gnu
+
+      - name: Cache kernel tarball
+        id: srcache
+        uses: actions/cache@v4
+        with:
+          path: linux-src.tar.gz
+          key: kernel-src-${{ inputs.kernel_ref }}
+
+      - name: Download kernel source
+        if: steps.srcache.outputs.cache-hit != 'true'
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o linux-src.tar.gz \
+            "https://codeload.github.com/silime/linux/tar.gz/${{ inputs.kernel_ref }}"
+          ls -lh linux-src.tar.gz
+
+      - name: Extract source
+        run: |
+          mkdir -p work
+          tar xzf linux-src.tar.gz -C work
+          KDIR="$(find work -maxdepth 1 -mindepth 1 -type d | head -1)"
+          echo "KDIR=$KDIR" >> "$GITHUB_ENV"
+          echo "源码: $KDIR"
+          grep -E '^VERSION =|^PATCHLEVEL =|^SUBLEVEL =|^EXTRAVERSION =' "$KDIR/Makefile"
+
+      - name: Configure with MMC enabled
+        run: |
+          set -eux
+          KDIR="$KDIR"; cd "$KDIR"
+          cp "$GITHUB_WORKSPACE/config-lenovo-q706f.aarch64" .config
+          python3 "$GITHUB_WORKSPACE/scripts/enable-mmc.py" .config
+          sed -i 's|^EXTRAVERSION =.*|EXTRAVERSION = -1|' Makefile
+
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make olddefconfig
+
+          # 关键断言：MMC 必须活着
+          grep -qE '^CONFIG_MMC=y$'            .config || { echo "::error::CONFIG_MMC 未生效"; exit 1; }
+          grep -qE '^CONFIG_MMC_BLOCK=y$'      .config || { echo "::error::MMC_BLOCK 未生效"; exit 1; }
+          grep -qE '^CONFIG_MMC_SDHCI=y$'      .config || { echo "::error::MMC_SDHCI 未生效"; exit 1; }
+          grep -qE '^CONFIG_MMC_SDHCI_MSM=y$'  .config || { echo "::error::SDHCI_MSM 未生效"; exit 1; }
+          grep -qE '^CONFIG_EXT4_FS=y$'        .config || { echo "::error::EXT4 未生效"; exit 1; }
+
+          echo "=== 最终 MMC 配置 ==="
+          grep -E '^CONFIG_MMC' .config
+
+          REL="$(make kernelrelease -s)"
+          echo "kernelrelease = $REL"
+          if [ "$REL" != "$TARGET_TRIPLE" ]; then
+            echo "::error::版本串不匹配: 算出 $REL, 目标 $TARGET_TRIPLE（模块将拒绝加载）"
+            exit 1
+          fi
+          echo "VERIFIED_TRIPLE=$REL" >> "$GITHUB_ENV"
+
+      - name: Build Image + dtbs
+        run: |
+          set -eux
+          cd "$KDIR"
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make -j"$(nproc)" Image dtbs
+          ls -lh arch/arm64/boot/Image
+          ls -lh arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dtb
+
+      - name: Build modules (optional)
+        if: ${{ inputs.build_modules }}
+        run: |
+          set -eux
+          cd "$KDIR"
+          export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+          make -j"$(nproc)" modules
+
+      - name: Verify MMC driver present in Image
+        run: |
+          set -eux
+          cd "$KDIR"
+          N_MMC=$(strings -a arch/arm64/boot/Image | grep -cE 'mmcblk|sdhci' || true)
+          echo "Image 中 mmcblk/sdhci 字符串命中: $N_MMC"
+          if [ "$N_MMC" -lt 1 ]; then
+            echo "::error::Image 里找不到 MMC 驱动符号，配置未真正生效"
+            exit 1
+          fi
+          strings -a arch/arm64/boot/Image | grep -E '^mmcblk|sdhci' | head -10 || true
+
+      - name: Repack boot.img
+        run: |
+          set -eux
+          mkdir -p out
+          cp "$KDIR/arch/arm64/boot/Image" out/kernel.img
+          cp "$KDIR/arch/arm64/boot/dts/qcom/sm8250-lenovo-q706f.dtb" out/dtb
+          cp ramdisk.img out/ramdisk
+
+          python3 scripts/mkboot.py header-template.bin \
+            out/kernel.img out/ramdisk out/dtb \
+            "${{ inputs.cmdline }}" out/boot.img
+
+          bash scripts/verify-bootimg.sh out/boot.img
+
+      - name: Stage modules tarball
+        if: ${{ inputs.build_modules }}
+        run: |
+          set -eux
+          mkdir -p out/mods
+          cd "$KDIR"
+          export ARCH=arm64
+          make modules_install INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/mods" INSTALL_MOD_STRIP=1
+          cd "$GITHUB_WORKSPACE"
+          echo "安装模块数: $(find out/mods -name '*.ko' | wc -l)"
+          ( cd "out/mods/lib/modules/$TARGET_TRIPLE" && \
+            tar czf "$GITHUB_WORKSPACE/out/modules-$TARGET_TRIPLE.tar.gz" . )
+          ls -lh out/modules-*.tar.gz
+
+      - name: Checksums
+        run: |
+          cd out
+          sha256sum boot.img kernel.img dtb > SHA256SUMS || true
+          sha256sum modules-*.tar.gz >> SHA256SUMS 2>/dev/null || true
+          cat SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: q706f-mmc-r${{ github.run_number }}
+          path: |
+            out/boot.img
+            out/kernel.img
+            out/dtb
+            out/SHA256SUMS
+            out/modules-*.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Create release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          TAG="build-r${{ github.run_number }}"
+          gh release create "$TAG" \
+            out/boot.img out/kernel.img out/dtb out/SHA256SUMS \
+            $(ls out/modules-*.tar.gz 2>/dev/null || true) \
+            --title "Q706F mainline 7.1.0 + MMC (r${{ github.run_number }})" \
+            --notes "$(printf '%s\n' \
+              "内核源码: \`silime/linux\` @ \`${{ inputs.kernel_ref }}\`" \
+              "" \
+              "vermagic: \`$TARGET_TRIPLE\` —— 与 Arch rootfs 的 \`/usr/lib/modules/\` 目录名一致" \
+              "" \
+              "**修复**: \`# CONFIG_MMC is not set\` → \`CONFIG_MMC=y\` + \`CONFIG_MMC_SDHCI_MSM=y\`" \
+              "" \
+              "cmdline: \`${{ inputs.cmdline }}\`" \
+              "" \
+              "因为 \`CONFIG_MODVERSIONS\` 与 \`CONFIG_MODULE_SIG\` 均未开启，" \
+              "rootfs 里现有的 .ko 无需替换即可加载到本内核。")"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Q706F MMC kernel build"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 源码 | \`${{ inputs.kernel_ref }}\` |"
+            echo "| vermagic | \`$TARGET_TRIPLE\` |"
+            echo "| 结果 | ${{ job.status }} |"
+            echo ""
+            echo "### Artifacts"
+            ls -lh out 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
