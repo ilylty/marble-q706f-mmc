@@ -73,6 +73,21 @@ jobs:
           echo "源码: $KDIR"
           grep -E '^VERSION =|^PATCHLEVEL =|^SUBLEVEL =|^EXTRAVERSION =' "$KDIR/Makefile"
 
+      - name: Apply charging fix patches
+        run: |
+          set -eux
+          cd "$KDIR"
+          # ★ 充电修复：APSD 未就绪时给降级电流，避免退化为 100mA
+          #   参考高通 BSP smb5-lib.c: update_sw_icl_max()
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            echo "=== applying $(basename "$p") ==="
+            patch -p1 --forward --batch < "$p"
+          done
+          echo "=== 补丁后关键片段 ==="
+          grep -n -A3 'FALLBACK_CURRENT_UA' drivers/power/supply/qcom_pm8150b_charger.c | head -20
+          grep -qE 'FALLBACK_CURRENT_UA\s+1500000' drivers/power/supply/qcom_pm8150b_charger.c \
+            || { echo "::error::补丁未生效"; exit 1; }
+
       - name: Configure with MMC enabled
         run: |
           set -eux
@@ -90,9 +105,13 @@ jobs:
           grep -qE '^CONFIG_MMC_SDHCI=y$'      .config || { echo "::error::MMC_SDHCI 未生效"; exit 1; }
           grep -qE '^CONFIG_MMC_SDHCI_MSM=y$'  .config || { echo "::error::SDHCI_MSM 未生效"; exit 1; }
           grep -qE '^CONFIG_EXT4_FS=y$'        .config || { echo "::error::EXT4 未生效"; exit 1; }
+          # 充电驱动必须是内置
+          grep -qE '^CONFIG_CHARGER_QCOM_SMB5=y$' .config || { echo "::error::SMB5 充电驱动未内置"; exit 1; }
 
           echo "=== 最终 MMC 配置 ==="
           grep -E '^CONFIG_MMC' .config
+          echo "=== 充电配置 ==="
+          grep -E 'CONFIG_CHARGER_QCOM_SMB5|CONFIG_TYPEC_QCOM_PMIC|CONFIG_BATTERY_BQ27XXX' .config
 
           REL="$(make kernelrelease -s)"
           echo "kernelrelease = $REL"
@@ -131,6 +150,14 @@ jobs:
             exit 1
           fi
           strings -a arch/arm64/boot/Image | grep -E '^mmcblk|sdhci' | head -10 || true
+
+          # ★ 验证充电补丁真的编进了内核
+          N_FB=$(strings -a arch/arm64/boot/Image | grep -c 'APSD not ready, applying fallback' || true)
+          echo "Image 中充电降级日志字符串: $N_FB"
+          if [ "$N_FB" -lt 1 ]; then
+            echo "::error::充电补丁未编进 Image"
+            exit 1
+          fi
 
           # Image.gz 必须存在且是 gzip、且尺寸接近出厂值
           test -f arch/arm64/boot/Image.gz || { echo "::error::Image.gz 未生成"; exit 1; }
@@ -222,6 +249,8 @@ jobs:
               "vermagic: \`$TARGET_TRIPLE\` —— 与 Arch rootfs 的 \`/usr/lib/modules/\` 目录名一致" \
               "" \
               "**修复**: \`# CONFIG_MMC is not set\` → \`CONFIG_MMC=y\` + \`CONFIG_MMC_SDHCI_MSM=y\`" \
+              "" \
+              "**充电修复 v1**: APSD 未就绪时降级到 1500mA（原逻辑不设电流，退化为 100mA）" \
               "" \
               "cmdline: \`${{ inputs.cmdline }}\`" \
               "" \

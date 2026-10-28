@@ -1,0 +1,43 @@
+--- a/drivers/power/supply/qcom_pm8150b_charger.c	2026-10-28 02:42:44.964858310 +0000
++++ b/drivers/power/supply/qcom_pm8150b_charger.c	2026-10-28 02:42:36.712858313 +0000
+@@ -256,6 +256,17 @@
+ #define DCP_CURRENT_UA			3300000
+ #define CURRENT_MAX_UA			DCP_CURRENT_UA
+ 
++/*
++ * APSD (automatic power source detection) 在本平台常因 VBUS 不稳
++ * 而永不置 APSD_DTC_STATUS_DONE_BIT，原逻辑此时只重试、不设电流，
++ * 退化为 SDP 100mA，导致插着充电器仍在掉电。
++ *
++ * 参考高通 BSP smb5-lib.c: update_sw_icl_max() 的 DCP 分支，
++ * 这里在 APSD 未就绪时先给一个保守电流，并保留重跑 APSD 的能力。
++ * 1500mA 留足 VBUS 余量，避免触发 AICL 反复塌压。
++ */
++#define FALLBACK_CURRENT_UA		1500000
++
+ /* pmi8150b registers represent current in increments of 1/40th of an amp */
+ #define CURRENT_SCALE_FACTOR		50000
+ /* clang-format on */
+@@ -507,11 +518,20 @@
+ 	}
+ 
+ 	if (rc < 0) {
++		/*
++		 * APSD 未就绪：先按保守档给电，别让充电链路空转。
++		 * 同时仍然重跑 APSD，若后续探测成功会被正确档位覆盖。
++		 */
++		dev_warn(chip->dev,
++			 "APSD not ready, applying fallback current %duA\n",
++			 FALLBACK_CURRENT_UA);
++		smb5_set_current_limit(chip, FALLBACK_CURRENT_UA);
++		power_supply_changed(chip->chg_psy);
++
+ 		rc = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
+ 					APSD_RERUN_BIT, APSD_RERUN_BIT);
+ 		schedule_delayed_work(&chip->status_change_work,
+-				      msecs_to_jiffies(1000));
+-		dev_dbg(chip->dev, "get charger type failed, rerun apsd\n");
++				      msecs_to_jiffies(5000));
+ 		return;
+ 	}
+ 
