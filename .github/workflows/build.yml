@@ -92,8 +92,11 @@ jobs:
           # 补丁 0002：USB 输入硬限流保护（防烧接口）
           echo "=== ICL 硬钳位检查 ==="
           grep -n 'USB_ICL_HARD_LIMIT_UA\|USB_ICL_MIN_UA' drivers/power/supply/qcom_pm8150b_charger.c | head -6
-          grep -qE '#define USB_ICL_HARD_LIMIT_UA\s+1500000' drivers/power/supply/qcom_pm8150b_charger.c \
-            || { echo "::error::补丁 0002 硬上限未生效"; exit 1; }
+          grep -qE '#define USB_ICL_HARD_LIMIT_UA\s+2500000' drivers/power/supply/qcom_pm8150b_charger.c \
+            || { echo "::error::补丁 0002 硬上限应为 2500000"; exit 1; }
+          # 确认 module param 描述串也跟着更新（避免文档与实现不一致）
+          grep -q '100000-2500000' drivers/power/supply/qcom_pm8150b_charger.c \
+            || { echo "::error::MODULE_PARM_DESC 范围未更新为 2500000"; exit 1; }
           grep -q 'static unsigned int smb5_clamp_icl' drivers/power/supply/qcom_pm8150b_charger.c \
             || { echo "::error::补丁 0002 钳位函数缺失"; exit 1; }
           grep -q 'DEVICE_ATTR_RW(icl_limit)' drivers/power/supply/qcom_pm8150b_charger.c \
@@ -284,9 +287,10 @@ jobs:
               "" \
               "**充电修复 v1**: APSD 未就绪时降级到 1500mA（原逻辑不设电流，退化为 100mA）" \
               "" \
-              "**USB 限流保护 v2**: 在唯一写入口 `smb5_set_current_limit()` 做硬钳位，" \
-              "任何来源（APSD/PD/sysfs）请求的电流都不超过 **1.5A**，防止大电流充电器烧接口。" \
-              "运行时可下调: `echo 1000000 > /sys/class/power_supply/pm8150b-charger/icl_limit`" \
+              "**USB 限流保护 v3**: 在唯一写入口 `smb5_set_current_limit()` 做硬钳位，" \
+              "任何来源（APSD/PD/sysfs）请求的电流都不超过 **2.5A**，防止大电流充电器烧接口。" \
+              "（此前为 1.5A，会限制 2.5A 充电器只能用到 1.5A。）" \
+              "运行时可下调: `echo 1000000 > .../charger@1000/icl_limit`" \
               "" \
               "cmdline: \`${{ inputs.cmdline }}\`" \
               "" \
