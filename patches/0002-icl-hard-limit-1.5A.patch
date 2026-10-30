@@ -1,0 +1,187 @@
+diff --git a/drivers/power/supply/qcom_pm8150b_charger.c b/drivers/power/supply/qcom_pm8150b_charger.c
+index bd5c749..801fe5e 100644
+--- a/drivers/power/supply/qcom_pm8150b_charger.c
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -257,6 +257,26 @@
+ #define DCP_CURRENT_UA			3300000
+ #define CURRENT_MAX_UA			DCP_CURRENT_UA
+ 
++/*
++ * USB 接口硬件保护上限。
++ *
++ * 本机 USB-C 座子与 VBUS 走线按 5V/3A 级别设计，PD 协商正常可到 3A。
++ * 但 BC1.2 误判或劣质充电器可能让 smb5 直接把 ICL 拉到 3.3A，
++ * 长时间大电流会让座子/线材过热，存在烧毁风险；而充电器若标称
++ * 2.5A 却被告知可给 3.3A，会陷入过载保护反复重试。
++ *
++ * 因此在唯一写入口 smb5_set_current_limit() 里做硬钳位：
++ * 任何来源（APSD / PD / sysfs）请求的电流都不会超过这个值。
++ * 运行时可通过 sysfs icl_limit 继续下调（只能更小，不能更大）。
++ */
++#define USB_ICL_HARD_LIMIT_UA		1500000
++#define USB_ICL_MIN_UA			100000
++
++static unsigned int usb_icl_limit_ua = USB_ICL_HARD_LIMIT_UA;
++module_param_named(icl_limit_ua, usb_icl_limit_ua, uint, 0644);
++MODULE_PARM_DESC(icl_limit_ua,
++		 "USB input current hard limit in uA (100000-1500000)");
++
+ /* pmi8150b registers represent current in increments of 1/40th of an amp */
+ #define CURRENT_SCALE_FACTOR		50000
+ /* clang-format on */
+@@ -307,6 +327,9 @@ struct smb5_chip {
+ 	struct iio_channel *usb_in_v_chan;
+ 
+ 	struct power_supply *chg_psy;
++
++	/* USB 输入电流硬限流保护 */
++	unsigned int icl_limit_ua;
+ };
+ 
+ static enum power_supply_property smb5_properties[] = {
+@@ -460,21 +483,95 @@ static inline int smb5_get_current_limit(struct smb5_chip *chip,
+ 	return rc;
+ }
+ 
+-static int smb5_set_current_limit(struct smb5_chip *chip, unsigned int val)
++/*
++ * 把任意请求电流钳到 [USB_ICL_MIN_UA, chip->icl_limit_ua] 区间内。
++ * 这是防止烧接口的最后一道闸：无论 APSD、PD 协商还是用户 sysfs
++ * 写入什么值，最终落到 USBIN_CURRENT_LIMIT_CFG 的都不会超过上限。
++ */
++static unsigned int smb5_clamp_icl(struct smb5_chip *chip, unsigned int val)
++{
++	unsigned int lim = chip->icl_limit_ua;
++
++	if (!lim || lim > USB_ICL_HARD_LIMIT_UA)
++		lim = USB_ICL_HARD_LIMIT_UA;
++
++	if (val > lim) {
++		dev_warn_ratelimited(chip->dev,
++			"ICL %uuA exceeds limit %uuA, clamped\n", val, lim);
++		val = lim;
++	}
++	if (val < USB_ICL_MIN_UA)
++		val = USB_ICL_MIN_UA;
++
++	return val;
++}
++
++static int __smb5_set_current_limit(struct smb5_chip *chip, unsigned int val)
+ {
+ 	unsigned char val_raw;
+ 
++	val_raw = val / CURRENT_SCALE_FACTOR;
++
++	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
++		val_raw);
++}
++
++static int smb5_set_current_limit(struct smb5_chip *chip, unsigned int val)
++{
++	unsigned int clamped;
++
+ 	if (val > 4950000) {
+ 		dev_err(chip->dev,
+ 			"Can't set current limit higher than 4950000uA");
+ 		return -EINVAL;
+ 	}
+-	val_raw = val / CURRENT_SCALE_FACTOR;
+ 
+-	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
+-		val_raw);
++	clamped = smb5_clamp_icl(chip, val);
++	return __smb5_set_current_limit(chip, clamped);
+ }
+ 
++/* ---- sysfs: 运行时调整上限（只能 <= 硬上限）---- */
++static ssize_t icl_limit_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct smb5_chip *chip = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%u\n", chip ? chip->icl_limit_ua : 0);
++}
++
++static ssize_t icl_limit_store(struct device *dev,
++			       struct device_attribute *attr,
++			       const char *buf, size_t count)
++{
++	struct smb5_chip *chip = dev_get_drvdata(dev);
++	unsigned int val;
++	int rc;
++
++	if (!chip)
++		return -ENODEV;
++
++	rc = kstrtouint(buf, 10, &val);
++	if (rc)
++		return rc;
++
++	if (val < USB_ICL_MIN_UA || val > USB_ICL_HARD_LIMIT_UA)
++		return -EINVAL;
++
++	chip->icl_limit_ua = val;
++	usb_icl_limit_ua = val;
++
++	/* 立刻按新上限重设一次，把正在跑的电流压下去 */
++	rc = __smb5_set_current_limit(chip,
++				      smb5_clamp_icl(chip, chip->icl_limit_ua));
++	if (rc < 0)
++		return rc;
++
++	dev_info(chip->dev, "USB ICL limit set to %uuA\n", chip->icl_limit_ua);
++	return count;
++}
++
++static DEVICE_ATTR_RW(icl_limit);
++
+ static int smb5_set_prop_charging_enabled(struct smb5_chip *chip, unsigned int val)
+ {
+ 	return regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
+@@ -886,6 +983,20 @@ static int smb5_probe(struct platform_device *pdev)
+ 	chip->dev = &pdev->dev;
+ 	chip->name = pdev->name;
+ 
++	/*
++	 * 初始化 USB 输入限流上限。module 参数若被设成非法值则回落到硬上限。
++	 */
++	chip->icl_limit_ua = usb_icl_limit_ua;
++	if (chip->icl_limit_ua < USB_ICL_MIN_UA ||
++	    chip->icl_limit_ua > USB_ICL_HARD_LIMIT_UA) {
++		dev_warn(chip->dev,
++			 "icl_limit_ua=%u out of range, using %u\n",
++			 chip->icl_limit_ua, USB_ICL_HARD_LIMIT_UA);
++		chip->icl_limit_ua = USB_ICL_HARD_LIMIT_UA;
++	}
++	dev_info(chip->dev, "USB input current hard limit: %uuA\n",
++		 chip->icl_limit_ua);
++
+ 	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
+ 	if (!chip->regmap)
+ 		return dev_err_probe(chip->dev, -ENODEV,
+@@ -911,6 +1022,13 @@ static int smb5_probe(struct platform_device *pdev)
+ 	if (rc < 0)
+ 		return rc;
+ 
++	/*
++	 * 硬件初始化可能把 ICL 设成默认 DCP 档（3.3A）。
++	 * 这里立刻压到保护上限，避免在 status_change_work 跑起来之前
++	 * 有一段时间是大电流。
++	 */
++	__smb5_set_current_limit(chip, chip->icl_limit_ua);
++
+ 	supply_config.drv_data = chip;
+ 	supply_config.fwnode = pdev->dev.fwnode;
+ 
+@@ -970,6 +1088,10 @@ static int smb5_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, chip);
+ 
++	rc = device_create_file(chip->dev, &dev_attr_icl_limit);
++	if (rc < 0)
++		dev_warn(chip->dev, "failed to create icl_limit sysfs: %d\n", rc);
++
+ 	/* Initialise charger state */
+ 	schedule_delayed_work(&chip->status_change_work, 0);
+ 
